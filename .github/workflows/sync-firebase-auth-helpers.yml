@@ -2,10 +2,11 @@ name: Sync Firebase Auth Helpers
 
 on:
   # 毎週月曜 04:00 JST
-  # GitHub Actions cron は UTC。
+  # GitHub Actions の cron は UTC なので、日曜 19:00 UTC。
   schedule:
     - cron: "0 19 * * 0"
 
+  # Actions画面から手動実行可能。
   workflow_dispatch:
 
 permissions:
@@ -20,6 +21,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Require main branch for manual runs
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        shell: bash
+        run: |
+          echo "::error::Manual sync must be run from the main branch."
+          exit 1
+
       - name: Checkout main
         uses: actions/checkout@v7
         with:
@@ -50,6 +58,8 @@ jobs:
             exit 1
           fi
 
+          echo "Firebase project: $FIREBASE_PROJECT_ID"
+
       - name: Download Firebase Auth helpers
         env:
           FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
@@ -64,18 +74,28 @@ jobs:
 
           mkdir -p "$temp_dir/__/auth"
 
-          files=(
-            "__/auth/handler"
-            "__/auth/handler.js"
-            "__/auth/experiments.js"
-            "__/auth/iframe"
-            "__/auth/iframe.js"
-            "__/auth/links"
-            "__/auth/links.js"
+          #
+          # Firebaseでは以下の拡張子なしURLが必要:
+          #
+          #   /__/auth/handler
+          #   /__/auth/iframe
+          #   /__/auth/links
+          #
+          # しかしGitHub Pagesに拡張子なしの実ファイルを配置すると、
+          # Content-TypeがHTMLにならずダウンロード扱いになる。
+          #
+          # そのため実ファイルは .html として保存する。
+          # GitHub Pagesは /handler に対して handler.html を配信する。
+          #
+
+          html_helpers=(
+            "handler"
+            "iframe"
+            "links"
           )
 
-          for file in "${files[@]}"; do
-            echo "Downloading ${file}"
+          for file in "${html_helpers[@]}"; do
+            echo "Downloading __/auth/${file} -> ${file}.html"
 
             curl \
               --fail \
@@ -85,20 +105,78 @@ jobs:
               --retry 3 \
               --retry-delay 2 \
               --retry-all-errors \
-              "${source_url}/${file}" \
-              --output "${temp_dir}/${file}"
+              "${source_url}/__/auth/${file}" \
+              --output "${temp_dir}/__/auth/${file}.html"
 
-            if [[ ! -s "${temp_dir}/${file}" ]]; then
+            if [[ ! -s "${temp_dir}/__/auth/${file}.html" ]]; then
+              echo "::error::Downloaded file is empty: ${file}.html"
+              exit 1
+            fi
+          done
+
+          #
+          # JavaScript helperは元のファイル名のまま保存する。
+          #
+
+          js_helpers=(
+            "handler.js"
+            "experiments.js"
+            "iframe.js"
+            "links.js"
+          )
+
+          for file in "${js_helpers[@]}"; do
+            echo "Downloading __/auth/${file}"
+
+            curl \
+              --fail \
+              --location \
+              --silent \
+              --show-error \
+              --retry 3 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              "${source_url}/__/auth/${file}" \
+              --output "${temp_dir}/__/auth/${file}"
+
+            if [[ ! -s "${temp_dir}/__/auth/${file}" ]]; then
               echo "::error::Downloaded file is empty: ${file}"
               exit 1
             fi
           done
 
-          # 全ファイル取得成功後に置換する。
+          #
+          # すべての取得に成功してから既存helperを置換する。
+          #
+          # 以前配置した拡張子なしの
+          # handler / iframe / links もここで削除される。
+          #
+
           rm -rf __/auth
           mkdir -p __/auth
 
           cp -a "$temp_dir/__/auth/." __/auth/
+
+          #
+          # 最終チェック。
+          #
+
+          expected_files=(
+            "__/auth/handler.html"
+            "__/auth/handler.js"
+            "__/auth/experiments.js"
+            "__/auth/iframe.html"
+            "__/auth/iframe.js"
+            "__/auth/links.html"
+            "__/auth/links.js"
+          )
+
+          for file in "${expected_files[@]}"; do
+            if [[ ! -s "$file" ]]; then
+              echo "::error::Firebase Auth helper is missing or empty: ${file}"
+              exit 1
+            fi
+          done
 
       - name: Generate Firebase init.json
         env:
@@ -124,17 +202,47 @@ jobs:
             }' \
             > __/firebase/init.json
 
-          jq -e \
+          if ! jq -e \
             --arg projectId "$FIREBASE_PROJECT_ID" \
-            '.projectId == $projectId' \
+            --arg authDomain "starling888888.github.io" \
+            '
+              .projectId == $projectId
+              and .authDomain == $authDomain
+              and (.apiKey | length > 0)
+              and (.appId | length > 0)
+            ' \
             __/firebase/init.json \
-            > /dev/null
+            > /dev/null; then
+            echo "::error::Generated Firebase init.json is invalid."
+            exit 1
+          fi
 
       - name: Ensure GitHub Pages serves helper paths
         shell: bash
         run: |
           set -euo pipefail
+
+          # GitHub PagesのJekyll処理を無効化し、
+          # __ ディレクトリをそのまま公開する。
           touch .nojekyll
+
+      - name: Show sync result
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Firebase Auth helper files:"
+          find __/auth -maxdepth 1 -type f -printf '%f\n' | sort
+
+          echo
+          echo "Firebase init.json:"
+          jq \
+            '{
+              authDomain,
+              projectId,
+              appId
+            }' \
+            __/firebase/init.json
 
       - name: Commit synced files
         shell: bash
