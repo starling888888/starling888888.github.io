@@ -1,0 +1,139 @@
+name: Sync Firebase Auth Helpers
+
+on:
+  # 毎週月曜 04:00 JST
+  # GitHub Actions の cron は UTC なので、日曜 19:00 UTC。
+  schedule:
+    - cron: "0 19 * * 0"
+
+  # Actions画面から手動実行可能。
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-firebase-auth-helpers
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Require main branch for manual runs
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Manual sync must be run from the main branch."
+          exit 1
+
+      - name: Checkout main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Validate Firebase project ID
+        env:
+          FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$FIREBASE_PROJECT_ID" ]]; then
+            echo "::error::Repository variable FIREBASE_PROJECT_ID is not configured."
+            exit 1
+          fi
+
+          echo "Firebase project: $FIREBASE_PROJECT_ID"
+
+      - name: Download Firebase Auth helpers
+        env:
+          FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source_url="https://${FIREBASE_PROJECT_ID}.firebaseapp.com"
+          temp_dir="$(mktemp -d)"
+
+          trap 'rm -rf "$temp_dir"' EXIT
+
+          mkdir -p \
+            "$temp_dir/__/auth" \
+            "$temp_dir/__/firebase"
+
+          files=(
+            "__/auth/handler"
+            "__/auth/handler.js"
+            "__/auth/experiments.js"
+            "__/auth/iframe"
+            "__/auth/iframe.js"
+            "__/auth/links"
+            "__/auth/links.js"
+            "__/firebase/init.json"
+          )
+
+          for file in "${files[@]}"; do
+            echo "Downloading ${file}"
+
+            curl \
+              --fail \
+              --location \
+              --silent \
+              --show-error \
+              --retry 3 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              "${source_url}/${file}" \
+              --output "${temp_dir}/${file}"
+
+            if [[ ! -s "${temp_dir}/${file}" ]]; then
+              echo "::error::Downloaded file is empty: ${file}"
+              exit 1
+            fi
+          done
+
+          if ! jq -e \
+            --arg project_id "$FIREBASE_PROJECT_ID" \
+            '.projectId == $project_id' \
+            "$temp_dir/__/firebase/init.json" \
+            > /dev/null; then
+            echo "::error::Firebase init.json projectId does not match FIREBASE_PROJECT_ID."
+            exit 1
+          fi
+
+          # 全取得に成功してから既存helperを置換する。
+          rm -rf __/auth
+          mkdir -p __/auth __/firebase
+
+          cp -a "$temp_dir/__/auth/." __/auth/
+          cp "$temp_dir/__/firebase/init.json" __/firebase/init.json
+
+          # GitHub Pagesで "__" ディレクトリをそのまま配信する。
+          touch .nojekyll
+
+      - name: Commit synced files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            .nojekyll \
+            __/auth \
+            __/firebase/init.json
+
+          if git diff --cached --quiet; then
+            echo "Firebase Auth helpers are already up to date."
+            exit 0
+          fi
+
+          git diff --cached --stat
+
+          git commit -m "chore: sync Firebase Auth helpers"
+
+          git pull --rebase origin main
+          git push origin HEAD:main
